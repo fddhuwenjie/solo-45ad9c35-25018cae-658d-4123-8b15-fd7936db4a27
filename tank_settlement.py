@@ -248,9 +248,16 @@ def allrows(conn, sql, args=()):
 def cal_delta(conn, benchmark_id, date):
     """取不晚于 date 的最新校准改正；无记录返回 (0.0, False)。"""
     r = conn.execute(
-        "SELECT delta_m FROM calibration WHERE benchmark_id=? AND date<=? "
+        "SELECT * FROM calibration WHERE benchmark_id=? AND date<=? "
         "ORDER BY date DESC, id DESC LIMIT 1", (benchmark_id, date)).fetchone()
     return (float(r["delta_m"]), True) if r else (0.0, False)
+
+
+def cal_latest(conn, benchmark_id, date):
+    """不晚于 date 的最新校准整行记录（含 stable 判定）。"""
+    return conn.execute(
+        "SELECT * FROM calibration WHERE benchmark_id=? AND date<=? "
+        "ORDER BY date DESC, id DESC LIMIT 1", (benchmark_id, date)).fetchone()
 
 
 # ----------------------------------------------------------------------------
@@ -306,47 +313,101 @@ def analyze_version(conn, version):
 
     rda, rdb = readings_of(ra), readings_of(rb)
 
-    # -- 原点与校准 -----------------------------------------------------------
+    # -- 联系水准（各轮联测点，原点改选与跨轮稳定性都要用） -------------------
+    ties = {}
+    for rnd in (ra, rb):
+        ties[rnd["id"]] = {t["benchmark_id"]: dict(t) for t in conn.execute(
+            "SELECT * FROM round_tie WHERE round_id=?", (rnd["id"],))}
+    ties_a, ties_b = ties[ra["id"]], ties[rb["id"]]
+
+    # -- 原点与校准（逐轮确定，允许版本改选原点） -----------------------------
     origin = one(conn, "SELECT * FROM benchmark WHERE id=?",
                  ((version["origin_benchmark_id"] or ra["origin_benchmark_id"]),))
-    if version["origin_benchmark_id"] and \
-            version["origin_benchmark_id"] != ra["origin_benchmark_id"]:
+    switched_rounds = []
+    for rnd in (ra, rb):
+        if origin["id"] != rnd["origin_benchmark_id"]:
+            switched_rounds.append(rnd)
+    if switched_rounds:
         issue("ORIGIN_SWITCHED", "info",
-              "本版本改选原点为 %s（理由：%s）" % (origin["code"], version["reason"]),
+              "本版本原点改选为 %s（理由：%s）；改选轮次 %s 按该轮联系水准重新归算"
+              % (origin["code"], version["reason"],
+                 "、".join(str(r["seq"]) for r in switched_rounds)),
+              round_ids=[r["id"] for r in switched_rounds],
               benchmark_ids=[origin["id"]])
 
-    def origin_delta(rnd):
-        bid = origin["id"]
-        d, has = cal_delta(conn, bid, rnd["measured_at"])
-        if has or origin["assumed_stable"]:
-            return d, has
-        return None, False
-
-    d_o_a, cal_a = origin_delta(ra)
-    d_o_b, cal_b = origin_delta(rb)
-
     round_fatal = {ra["id"]: [], rb["id"]: []}   # 每轮的致命问题代码
+    origin_ctx = {}   # round_id -> 该轮实际原点高程/改正/来源
 
-    if d_o_a is None:
-        issue("UNTIED", "fatal",
-              "轮次 %d 的水准原点 BM-%s 无校准资料且非假定稳定点，无法归算"
-              % (ra["seq"], origin["code"]),
-              round_ids=[ra["id"]], benchmark_ids=[origin["id"]],
-              resurvey={"type": "原点校准补测", "benchmark": origin["code"]})
-        round_fatal[ra["id"]].append("UNTIED")
-    if d_o_b is None:
-        issue("UNTIED", "fatal",
-              "轮次 %d 的水准原点 BM-%s 无校准资料且非假定稳定点，无法归算"
-              % (rb["seq"], origin["code"]),
-              round_ids=[rb["id"]], benchmark_ids=[origin["id"]],
-              resurvey={"type": "原点校准补测", "benchmark": origin["code"]})
-        round_fatal[rb["id"]].append("UNTIED")
-    if not cal_a:
-        issue("CAL_MISSING", "info", "原点在轮次 %d 观测日前无校准记录，按 0 处理" % ra["seq"],
-              round_ids=[ra["id"]])
-    if not cal_b:
-        issue("CAL_MISSING", "info", "原点在轮次 %d 观测日前无校准记录，按 0 处理" % rb["seq"],
-              round_ids=[rb["id"]])
+    def resolve_origin(rnd):
+        """逐轮确定实际原点读数、稳定系改正与来源；记录致命/提示问题。"""
+        bid = origin["id"]
+        calrow = cal_latest(conn, bid, rnd["measured_at"])
+        has_cal = calrow is not None
+        cal_delta_m = float(calrow["delta_m"]) if has_cal else 0.0
+
+        if bid == rnd["origin_benchmark_id"]:
+            # 沿用本轮原观测原点
+            if rnd["origin_reading_m"] is None:
+                raise ApiError(400, "BAD_ROUND",
+                               "轮次 %d 缺原点观测高程" % rnd["seq"])
+            origin_h, source = float(rnd["origin_reading_m"]), "round.origin_reading_m"
+        else:
+            # 改选原点：必须以该轮 round_tie.tie_elevation_m 重新归算
+            tie = ties[rnd["id"]].get(bid)
+            if not tie or tie["tie_elevation_m"] is None:
+                issue("UNTIED", "fatal",
+                      "轮次 %d 未对改选原点 %s 作联系联测，无法重新归算"
+                      % (rnd["seq"], origin["code"]),
+                      round_ids=[rnd["id"]], benchmark_ids=[bid],
+                      resurvey={"type": "改选原点联测补测",
+                                "round_seq": rnd["seq"], "benchmark": origin["code"]})
+                round_fatal[rnd["id"]].append("UNTIED")
+                origin_ctx[rnd["id"]] = {"reading_m": None, "delta_m": 0.0,
+                                         "source": "missing_tie", "has_cal": has_cal}
+                return
+            origin_h = float(tie["tie_elevation_m"])
+            source = "round_tie.tie_elevation_m"
+            # 联测自带稳定系改正时，优先采用（无独立校准资料）
+            if tie["delta_stable_m"] is not None and not has_cal:
+                cal_delta_m = float(tie["delta_stable_m"])
+                has_cal = True
+
+        # 校准资料 stable=0：原点失稳，该轮弧段一律不计算
+        if calrow is not None and calrow["stable"] == 0:
+            note = calrow["note"] or ""
+            issue("ORIGIN_UNSTABLE", "fatal",
+                  "校准资料判定原点 %s 在轮次 %d（%s）失稳%s，弧段不计算"
+                  % (origin["code"], rnd["seq"], calrow["date"],
+                     ("：" + note) if note else ""),
+                  round_ids=[rnd["id"]], benchmark_ids=[bid],
+                  metric="calibration.stable", value=0, limit=1,
+                  resurvey={"type": "原点重新检定/另选稳定原点",
+                            "round_seq": rnd["seq"], "benchmark": origin["code"]})
+            round_fatal[rnd["id"]].append("ORIGIN_UNSTABLE")
+
+        if not has_cal:
+            if origin["assumed_stable"]:
+                issue("CAL_MISSING", "info",
+                      "原点 %s 在轮次 %d 观测日前无校准记录，按假定稳定点处理"
+                      % (origin["code"], rnd["seq"]), round_ids=[rnd["id"]])
+            else:
+                issue("UNTIED", "fatal",
+                      "轮次 %d 的水准原点 %s 无校准资料且非假定稳定点，无法归算"
+                      % (rnd["seq"], origin["code"]),
+                      round_ids=[rnd["id"]], benchmark_ids=[bid],
+                      resurvey={"type": "原点校准补测", "benchmark": origin["code"]})
+                round_fatal[rnd["id"]].append("UNTIED")
+
+        origin_ctx[rnd["id"]] = {"reading_m": origin_h, "delta_m": cal_delta_m,
+                                 "source": source, "has_cal": has_cal}
+
+    resolve_origin(ra)
+    resolve_origin(rb)
+
+    d_o_a = origin_ctx[ra["id"]]["delta_m"]
+    d_o_b = origin_ctx[rb["id"]]["delta_m"]
+    cal_a = origin_ctx[ra["id"]]["has_cal"]
+    cal_b = origin_ctx[rb["id"]]["has_cal"]
 
     # -- 环线闭合差 -----------------------------------------------------------
     def check_loop(rnd):
@@ -369,22 +430,23 @@ def analyze_version(conn, version):
     check_loop(ra)
     check_loop(rb)
 
-    # -- 联系水准：原点稳定性（跨轮） -----------------------------------------
-    ties_a = {t["benchmark_id"]: dict(t) for t in conn.execute(
-        "SELECT * FROM round_tie WHERE round_id=?", (ra["id"],))}
-    ties_b = {t["benchmark_id"]: dict(t) for t in conn.execute(
-        "SELECT * FROM round_tie WHERE round_id=?", (rb["id"],))}
-
+    # -- 联系水准：原点稳定性（跨轮，按版本实际原点逐轮归算） -----------------
     rel_changes = []
     for bid in sorted(set(ties_a) & set(ties_b)):
+        if bid == origin["id"]:
+            continue   # 原点自身不作校核点
         bm = one(conn, "SELECT * FROM benchmark WHERE id=?", (bid,))
-        dja, _ = cal_delta(conn, bid, ra["measured_at"])
-        djb, _ = cal_delta(conn, bid, rb["measured_at"])
+        dja, has_a = cal_delta(conn, bid, ra["measured_at"])
+        djb, has_b = cal_delta(conn, bid, rb["measured_at"])
         if not bm["assumed_stable"]:
             dja = ties_a[bid]["delta_stable_m"] if ties_a[bid]["delta_stable_m"] is not None else dja
             djb = ties_b[bid]["delta_stable_m"] if ties_b[bid]["delta_stable_m"] is not None else djb
-        ch = (ties_b[bid]["tie_elevation_m"] - (rb["origin_reading_m"] or 0)) \
-             - (ties_a[bid]["tie_elevation_m"] - (ra["origin_reading_m"] or 0)) \
+        org_a = origin_ctx[ra["id"]]["reading_m"]
+        org_b = origin_ctx[rb["id"]]["reading_m"]
+        if org_a is None or org_b is None:
+            continue
+        ch = (ties_b[bid]["tie_elevation_m"] - org_b) \
+             - (ties_a[bid]["tie_elevation_m"] - org_a) \
              - (djb - dja)
         rel_changes.append((bid, bm["code"], ch))
     if rel_changes:
@@ -433,28 +495,80 @@ def analyze_version(conn, version):
                   resurvey={"type": "方位核查/重新编号", "azimuth_deg": az,
                             "markers": [by_id[i]["code"] for i in ids]})
 
-    # -- 每轮：漏测 + 观测次序倒置 --------------------------------------------
+    # -- 每轮：漏测 + 观测次序倒置（次序校验只认逐轮 reading.order_idx，
+    #    且剔除读数不参与次序判定） ------------------------------------------
     observed = {ra["id"]: set(rda), rb["id"]: set(rdb)}
 
+    def excluded_in_round(rnd):
+        rows = rda if rnd["id"] == ra["id"] else rdb
+        return {m for m, row in rows.items() if row["id"] in excluded}
+
     def order_check(rnd, rdict):
-        obs = [m for m in ring if m["id"] in rdict and m["ring_order"] is not None]
+        """按逐轮 reading.order_idx 检查环向观测次序，倒置邻边加入阻断集。
+
+        只对两个端点均有有效读数且确为环向相邻（含闭合边）的边判倒置；
+        观测从最大序点闭合回最小序点的那一条物理闭合边属正常收测，不判倒置；
+        连续倒置段归并成一条 ORDER_INVERSION。
+        """
+        skip = excluded_in_round(rnd)
+        idx_of = {}
+        for m in ring:
+            row = rdict.get(m["id"])
+            if row is None or row["order_idx"] is None or m["id"] in skip:
+                continue
+            idx_of[m["id"]] = int(row["order_idx"])
+
+        n = len(ring)
+        oriented = [(ring[i]["id"], ring[(i + 1) % n]["id"]) for i in range(n)]
+
+        # 闭合边：序号最大点与最小序点若环向相邻，该边为正常收测边
+        closure = None
+        if len(idx_of) >= 2:
+            mk_max = max(idx_of, key=lambda k: (idx_of[k], k))
+            mk_min = min(idx_of, key=lambda k: (idx_of[k], -k))
+            for a, b in oriented:
+                if (a, b) == (mk_max, mk_min) or (a, b) == (mk_min, mk_max):
+                    closure = (a, b)
+                    break
+
         inversions = set()
-        for i in range(len(obs) - 1):
-            m1, m2 = obs[i], obs[i + 1]
-            if int(m2["ring_order"]) <= int(m1["ring_order"]):
-                inversions.add((m1["id"], m2["id"]))
+        for a, b in oriented:
+            if (a, b) == closure:
+                continue
+            if a in idx_of and b in idx_of and idx_of[b] <= idx_of[a]:
+                inversions.add((a, b))
+
+        if inversions:
+            inv_idx = {i for i, e in enumerate(oriented) if e in inversions}
+            ordered = sorted(inv_idx)
+            runs, cur = [], [ordered[0]]
+            for x in ordered[1:]:
+                if x == cur[-1] + 1:
+                    cur.append(x)
+                else:
+                    runs.append(cur)
+                    cur = [x]
+            runs.append(cur)
+            for run in runs:
+                e_ids = []
+                segs = []
+                for s in run:
+                    a, b = oriented[s]
+                    e_ids.extend([a, b])
+                    segs.append("%s(序%d)→%s(序%d)" % (
+                        by_id[a]["code"], idx_of[a],
+                        by_id[b]["code"], idx_of[b]))
+                e_ids = sorted(set(e_ids))
                 issue("ORDER_INVERSION", "warning",
-                      "轮次 %d 观测次序倒置：%s(序%s) -> %s(序%s)，该邻边不计算"
-                      % (rnd["seq"], m1["code"], m1["ring_order"],
-                         m2["code"], m2["ring_order"]),
-                      round_ids=[rnd["id"]], marker_ids=[m1["id"], m2["id"]],
-                      edge=[m1["id"], m2["id"]],
+                      "轮次 %d 观测次序倒置（%d 条有效读数弧段）：%s，受影响弧段不计算"
+                      % (rnd["seq"], len(run), "、".join(segs)),
+                      round_ids=[rnd["id"]], marker_ids=e_ids,
+                      reading_ids=[rdict[m]["id"] for m in e_ids if m in rdict],
                       resurvey={"type": "观测次序核查", "round_seq": rnd["seq"],
-                                "markers": [m1["code"], m2["code"]]})
+                                "markers": [by_id[m]["code"] for m in e_ids]})
         return inversions
 
     inv_edges = order_check(ra, rda) | order_check(rb, rdb)
-    inv_markers = set(x for e in inv_edges for x in e)
 
     for m in ring:
         for rnd, rdict in ((ra, rda), (rb, rdb)):
@@ -484,18 +598,26 @@ def analyze_version(conn, version):
 
     def reduce(rnd, reading_row, m):
         H = float(reading_row["elevation_m"])
-        rel = H - (rnd["origin_reading_m"] if rnd["origin_reading_m"] is not None else 0)
-        d_o, _ = origin_delta(rnd)
-        d_o = d_o or 0.0
+        ctx = origin_ctx[rnd["id"]]
+        org_h = ctx["reading_m"]
+        if org_h is None:
+            return None, None
+        rel = H - org_h
+        d_o = ctx["delta_m"]
         therm = 0.0 if m["is_center"] else alpha * href * float(rnd["wall_temp_c"] or 0)
         load = float(rnd["load_coeff_m_per_m"] or 0) * float(rnd["liquid_level_m"] or 0)
-        return rel + d_o + therm + load, {"origin_delta_m": d_o,
+        return rel + d_o + therm + load, {"origin_reading_m": org_h,
+                                          "origin_source": ctx["source"],
+                                          "origin_delta_m": d_o,
                                           "thermal_m": therm, "load_m": load}
 
     corr_a, corr_b = {}, {}
     corr_terms = {}
     for rnd, rdict, store in ((ra, rda, corr_a), (rb, rdb, corr_b)):
         terms = {}
+        if origin_ctx[rnd["id"]]["reading_m"] is None:
+            corr_terms[rnd["id"]] = terms
+            continue
         for m in ring:
             if m["id"] in rdict:
                 store[m["id"]], terms[m["id"]] = reduce(rnd, rdict[m["id"]], m)
@@ -782,10 +904,10 @@ def analyze_version(conn, version):
         "version_id": version["id"],
         "tank": {"id": tank["id"], "name": tank["name"], "radius_m": tank["radius_m"]},
         "rounds": {
-            "a": _round_brief(ra, origin, d_o_a, corr_terms.get(ra["id"], {}),
-                              center, ring, ra["origin_reading_m"]),
-            "b": _round_brief(rb, origin, d_o_b, corr_terms.get(rb["id"], {}),
-                              center, ring, rb["origin_reading_m"]),
+            "a": _round_brief(ra, origin, origin_ctx[ra["id"]],
+                              corr_terms.get(ra["id"], {}), ring),
+            "b": _round_brief(rb, origin, origin_ctx[rb["id"]],
+                              corr_terms.get(rb["id"], {}), ring),
         },
         "params": params,
         "points": points,
@@ -805,13 +927,16 @@ def analyze_version(conn, version):
     return result
 
 
-def _round_brief(rnd, origin, d_o, terms, center, ring, origin_reading):
+def _round_brief(rnd, origin, ctx, terms, ring):
     used = [terms.get(m["id"], {}) for m in ring]
     return {
         "id": rnd["id"], "seq": rnd["seq"], "measured_at": rnd["measured_at"],
         "origin_benchmark": origin["code"],
-        "origin_reading_m": origin_reading,
-        "origin_delta_m": d_o,
+        "origin_reading_m": ctx["reading_m"],
+        "origin_source": ctx["source"],
+        "origin_record_benchmark_id": rnd["origin_benchmark_id"],
+        "origin_switched": origin["id"] != rnd["origin_benchmark_id"],
+        "origin_delta_m": ctx["delta_m"],
         "wall_temp_c": rnd["wall_temp_c"],
         "liquid_level_m": rnd["liquid_level_m"],
         "load_coeff_m_per_m": rnd["load_coeff_m_per_m"],
@@ -1609,8 +1734,240 @@ def selftest(db_path=":memory:"):
     print("致命版本: 检出 %s，全部弧段阻断，补测项 %d 条，版本拒绝锁定"
           % (",".join(sorted(c2)), len(res2["resurvey"])))
 
+    reg1_origin_switch_rereduce(conn)
+    reg2_stable_zero(conn)
+    reg3_reading_order_idx(conn)
+
     print("SELF-TEST PASS")
     return True
+
+
+def _make_version_row(conn, tank_id, seq, ra_id, rb_id, reason,
+                      origin_id=None, excluded=None):
+    return one(conn,
+        "SELECT * FROM version WHERE id=(?)",
+        (conn.execute(
+            "INSERT INTO version(tank_id,seq,round_a_id,round_b_id,"
+            "origin_benchmark_id,excluded_readings,params,reason,status,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?, 'draft', ?)",
+            (tank_id, seq, ra_id, rb_id, origin_id,
+             json.dumps(excluded or {}, ensure_ascii=False), "{}",
+             reason, now_iso())).lastrowid,))
+
+
+# ---------------------------------------------------------------------------
+# 回归 1：改选原点必须按各轮 round_tie.tie_elevation_m 重新归算
+# ---------------------------------------------------------------------------
+
+def reg1_origin_switch_rereduce(conn):
+    tid = conn.execute(
+        "INSERT INTO tank(name,radius_m,wall_alpha,ref_height_m,created_at)"
+        " VALUES('RG1',10,1.2e-5,0,?)", (now_iso(),)).lastrowid
+    nm = 8
+    mids = []
+    for i in range(nm):
+        mids.append(conn.execute(
+            "INSERT INTO marker(tank_id,code,azimuth_deg,ring_order) VALUES(?,?,?,?)",
+            (tid, "R1-%02d" % (i + 1), i * 360.0 / nm, i + 1)).lastrowid)
+
+    bm0 = conn.execute(
+        "INSERT INTO benchmark(code,assumed_stable,description,created_at)"
+        " VALUES('R1-BM0',1,'原观测原点',?)", (now_iso(),)).lastrowid
+    bm1 = conn.execute(
+        "INSERT INTO benchmark(code,assumed_stable,description,created_at)"
+        " VALUES('R1-BM1',1,'改选原点（假定稳定，无校准）',?)", (now_iso(),)).lastrowid
+
+    # 两轮无温度/液位改正；O0 读数不变，O1 两轮读数相差 -0.0005 m；
+    # 基础真实沉降：轮1→轮2 为 0.010 m（标志高程两轮差 -0.010）
+    O0_1, O0_2 = 20.000, 20.000
+    O1_1, O1_2 = 22.350, 22.3495
+    def mk_round(seq, date, O0, O1):
+        rid = conn.execute(
+            "INSERT INTO round(tank_id,seq,measured_at,origin_benchmark_id,"
+            "origin_reading_m,liquid_level_m,wall_temp_c,loop_misclosure_m,"
+            "loop_length_km) VALUES(?,?,?,?,?,0,0,0.001,1)",
+            (tid, seq, date, bm0, O0)).lastrowid
+        for j, mid in enumerate(mids):
+            conn.execute(
+                "INSERT INTO reading(round_id,marker_id,elevation_m,order_idx)"
+                " VALUES(?,?,?,?)",
+                (rid, mid, O0 + 1.0 - (0.010 if seq == 2 else 0.0), j + 1))
+        conn.execute("INSERT INTO round_tie(round_id,benchmark_id,tie_elevation_m)"
+                     " VALUES(?,?,?)", (rid, bm1, O1))
+        return rid
+
+    r1 = mk_round(1, "2025-01-10T00:00:00Z", O0_1, O1_1)
+    r2 = mk_round(2, "2025-04-10T00:00:00Z", O0_2, O1_2)
+    conn.commit()
+
+    # 原原点版本：body 应恰为 0.010
+    v0 = _make_version_row(conn, tid, 101, r1, r2, "回归1-原原点对照")
+    res0 = analyze_version(conn, v0)
+    assert res0["status"] == "draft", res0
+    assert abs(res0["decomposition"]["body_m"] - 0.010) < 1e-9, \
+        res0["decomposition"]["body_m"]
+
+    # 改选 BM1：必须逐轮按 tie_elevation_m 重算，整体升降相应 -0.0005
+    v1 = _make_version_row(conn, tid, 102, r1, r2,
+                           "回归1-改选 R1-BM1（联测显示其更稳定）",
+                           origin_id=bm1)
+    res1 = analyze_version(conn, v1)
+    fatal = [i for i in res1["issues"] if i["severity"] == "fatal"]
+    assert not fatal, [i["code"] for i in fatal]
+    codes = {i["code"] for i in res1["issues"]}
+    assert "ORIGIN_SWITCHED" in codes
+    assert res1["rounds"]["a"]["origin_source"] == "round_tie.tie_elevation_m"
+    assert res1["rounds"]["b"]["origin_source"] == "round_tie.tie_elevation_m"
+    assert abs(res1["rounds"]["a"]["origin_reading_m"] - O1_1) < 1e-12
+    assert abs(res1["rounds"]["b"]["origin_reading_m"] - O1_2) < 1e-12
+    body1 = res1["decomposition"]["body_m"]
+    delta = body1 - res0["decomposition"]["body_m"]
+    assert abs(body1 - 0.0095) < 1e-9, body1
+    assert abs(delta - (-0.0005)) < 1e-9, delta
+    assert res1["points"][0]["settlement_m"] is not None
+    print("回归1 改选原点重归算: body %.4f -> %.4f（Δ %+.4f m，符合 -0.0005）"
+          % (res0["decomposition"]["body_m"], body1, delta))
+
+
+# ---------------------------------------------------------------------------
+# 回归 2：calibration.stable=0 必须判失稳，阻止生成可锁定结果
+# ---------------------------------------------------------------------------
+
+def reg2_stable_zero(conn):
+    tid = conn.execute(
+        "INSERT INTO tank(name,radius_m,wall_alpha,ref_height_m,created_at)"
+        " VALUES('RG2',10,1.2e-5,0,?)", (now_iso(),)).lastrowid
+    mids = []
+    for i in range(8):
+        mids.append(conn.execute(
+            "INSERT INTO marker(tank_id,code,azimuth_deg,ring_order) VALUES(?,?,?,?)",
+            (tid, "R2-%02d" % (i + 1), i * 45.0, i + 1)).lastrowid)
+    bm = conn.execute(
+        "INSERT INTO benchmark(code,assumed_stable,description,created_at)"
+        " VALUES('R2-BM0',0,'有校准史但近期失稳',?)", (now_iso(),)).lastrowid
+
+    # 稳定校准：2024 年内 delta=0 stable=1
+    conn.execute("INSERT INTO calibration(benchmark_id,date,delta_m,stable,note)"
+                 " VALUES(?,?,0,1,'年度复测稳定')", (bm, "2024-06-01"))
+    # 失稳校准：2025-03 复查 stable=0（两轮观测都在此之后，必须命中）
+    conn.execute("INSERT INTO calibration(benchmark_id,date,delta_m,stable,note)"
+                 " VALUES(?,?,-0.005,0,'厂区新管线沉降，点位移出')",
+                 (bm, "2025-03-01"))
+
+    def mk_round(seq, date):
+        rid = conn.execute(
+            "INSERT INTO round(tank_id,seq,measured_at,origin_benchmark_id,"
+            "origin_reading_m,wall_temp_c,loop_misclosure_m,loop_length_km)"
+            " VALUES(?,?,?,?,?,0,0.001,1)",
+            (tid, seq, date, bm, 15.0)).lastrowid
+        for j, mid in enumerate(mids):
+            conn.execute(
+                "INSERT INTO reading(round_id,marker_id,elevation_m,order_idx)"
+                " VALUES(?,?,?,?)", (rid, mid, 16.0 - 0.002 * seq, j + 1))
+        return rid
+
+    r1 = mk_round(1, "2025-04-01T00:00:00Z")
+    r2 = mk_round(2, "2025-05-01T00:00:00Z")
+    conn.commit()
+
+    v = _make_version_row(conn, tid, 201, r1, r2, "回归2-stable=0 失稳判定")
+    res = analyze_version(conn, v)
+    inst = [i for i in res["issues"] if i["code"] == "ORIGIN_UNSTABLE"
+            and i["severity"] == "fatal"]
+    assert len(inst) == 2, [i["message"] for i in inst]   # 两轮各一条
+    assert all(i["metric"] == "calibration.stable" for i in inst)
+    assert res["status"] == "rejected"
+    assert all(e["blocked"] for e in res["edges"])
+    assert any(r.get("benchmark") == "R2-BM0" for r in res["resurvey"])
+    assert res["decomposition"] is None
+    print("回归2 stable=0: 两轮均判原点失稳，状态 rejected，全部 %d 弧阻断，不可锁定"
+          % len(res["edges"]))
+
+
+# ---------------------------------------------------------------------------
+# 回归 3：次序校验读取逐轮 reading.order_idx；15 条有效读数反向触发并阻断
+# ---------------------------------------------------------------------------
+
+def reg3_reading_order_idx(conn):
+    tid = conn.execute(
+        "INSERT INTO tank(name,radius_m,wall_alpha,ref_height_m,created_at)"
+        " VALUES('RG3',10,1.2e-5,0,?)", (now_iso(),)).lastrowid
+    n = 16
+    mids = []
+    for i in range(n):
+        mids.append(conn.execute(
+            "INSERT INTO marker(tank_id,code,azimuth_deg,ring_order) VALUES(?,?,?,?)",
+            # ring_order 故意保持正常升序：若仍误用它就不会报倒置
+            (tid, "R3-%02d" % (i + 1), i * 22.5, i + 1)).lastrowid)
+    bm = conn.execute(
+        "INSERT INTO benchmark(code,assumed_stable,description,created_at)"
+        " VALUES('R3-BM0',1,'原点',?)", (now_iso(),)).lastrowid
+
+    exclude_idx = 8   # R3-09 读数经版本剔除：16 条观测 -> 15 条有效读数
+
+    def mk_round(seq, date, reversed_order):
+        rid = conn.execute(
+            "INSERT INTO round(tank_id,seq,measured_at,origin_benchmark_id,"
+            "origin_reading_m,wall_temp_c,loop_misclosure_m,loop_length_km)"
+            " VALUES(?,?,?,?,?,0,0.001,1)",
+            (tid, seq, date, bm, 30.0)).lastrowid
+        for i, mid in enumerate(mids):
+            if reversed_order:
+                # 反向施测：方位 0° 的点最后测；order_idx 随方位递减
+                order = n - i
+            else:
+                order = i + 1
+            conn.execute(
+                "INSERT INTO reading(round_id,marker_id,elevation_m,order_idx)"
+                " VALUES(?,?,?,?)", (rid, mid, 31.0 - 0.001 * seq, order))
+        return rid
+
+    r_ok = mk_round(1, "2025-02-01T00:00:00Z", reversed_order=False)
+    r_rev = mk_round(2, "2025-03-01T00:00:00Z", reversed_order=True)
+    excl_row = one(conn, "SELECT id FROM reading WHERE round_id=? AND marker_id=?",
+                   (r_rev, mids[exclude_idx]))
+    conn.commit()
+
+    excluded = {excl_row["id"]: "扶尺碰动，按流程剔除（回归3）"}
+    v = _make_version_row(conn, tid, 301, r_ok, r_rev,
+                          "回归3-order_idx 反向施测", excluded=excluded)
+    res = analyze_version(conn, v)
+    inv = [i for i in res["issues"] if i["code"] == "ORDER_INVERSION"]
+    # 剔除点把反向序列拆成两段（7 弧 + 6 弧），故有两条问题
+    assert len(inv) == 2, [i["message"] for i in inv]
+    assert all(x["round_ids"] == [r_rev] for x in inv)
+    assert sum("条有效读数弧段" in x["message"] for x in inv)
+    arc_counts = [int(x["message"].split("（")[1].split(" ")[0]) for x in inv]
+    assert sorted(arc_counts) == [6, 7], arc_counts
+    # 15 条有效读数反向：收测闭合边（序16点→序1点）不判倒置，是唯一保留弧；
+    # 剔除点两侧邻边 2 条（含闭合边）按"读数已剔除"阻断；倒置阻断
+    # 16-1-2=13 条（两段 7+6），剔除补阻断 2 条，合计 15/16
+    blocked = [e for e in res["edges"] if e["blocked"]]
+    inv_block = [e for e in res["edges"]
+                 if any("观测次序倒置" in x for x in e["block_reasons"])]
+    excl_block = [e for e in res["edges"]
+                  if any("已剔除" in x for x in e["block_reasons"])]
+    assert len(inv_block) == 13, len(inv_block)
+    assert len(excl_block) == 2, [(e["from_code"], e["to_code"]) for e in excl_block]
+    assert len(blocked) == 15, len(blocked)
+    rev_readings = allrows(conn, "SELECT id,marker_id FROM reading WHERE round_id=?",
+                           (r_rev,))
+    valid_ids = {r["id"] for r in rev_readings if r["id"] != excl_row["id"]}
+    reported = {rid for x in inv for rid in x["reading_ids"]}
+    assert valid_ids == reported, "应回指 15 条有效原始读数 id"
+    print("回归3 reading.order_idx: 15 条有效读数反向 -> ORDER_INVERSION"
+          "（%d+%d 弧两段），倒置阻断 %d、剔除补阻断 %d、合计 %d/%d"
+          "（闭合边保留），回指 15 个读数 id"
+          % (sorted(arc_counts)[0], sorted(arc_counts)[1],
+             len(inv_block), len(excl_block), len(blocked), len(res["edges"])))
+
+    # 对照：两轮均按升序施测时，不应产生 ORDER_INVERSION
+    r_ok2 = mk_round(3, "2025-04-01T00:00:00Z", reversed_order=False)
+    conn.commit()
+    vc = _make_version_row(conn, tid, 302, r_ok, r_ok2, "回归3-升序对照")
+    resc = analyze_version(conn, vc)
+    assert not any(i["code"] == "ORDER_INVERSION" for i in resc["issues"])
+    print("回归3 对照组: 升序施测无误报 ORDER_INVERSION")
 
 
 def main():

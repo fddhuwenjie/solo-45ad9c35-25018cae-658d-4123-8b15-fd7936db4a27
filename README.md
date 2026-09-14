@@ -9,8 +9,18 @@
 ```bash
 python3 tank_settlement.py --host 0.0.0.0 --port 8080 --db settlement.db
 python3 tank_settlement.py --demo          # 植入一个 16 点示范罐后启动
-python3 tank_settlement.py --selftest      # 内置数值/质检自测
+python3 tank_settlement.py --selftest      # 内置数值/质检自测（含三条缺陷回归）
 ```
+
+`--selftest` 除数值复原外，固定复现三条复核确认缺陷的回归用例：
+
+1. `reg1_origin_switch_rereduce`：改选 BM1 后逐轮按 `round_tie.tie_elevation_m`
+   重归算；联系偏移 2.3500→2.3495 m 时整体升降由 0.0100 变为 0.0095（Δ=−0.0005）；
+2. `reg2_stable_zero`：`calibration.stable=0` 两轮均判原点失稳，全弧阻断，
+   版本 `rejected` 不可锁定；
+3. `reg3_reading_order_idx`：校验读取逐轮 `reading.order_idx`；15 条有效读数反向施测
+   时产生 `ORDER_INVERSION`（7+6 弧两段），13 条倒置弧加剔除点两邻边阻断，仅收测闭合边
+   保留，问题回指 15 个原始读数 id；升序对照组不误报。
 
 ## 数据模型（SQLite）
 
@@ -30,10 +40,17 @@ python3 tank_settlement.py --selftest      # 内置数值/质检自测
 每轮每个标志先归算到稳定高程系（`s>0` 表示下沉）：
 
 ```
-h_r(m) = H_r(m) − H_r(原点) + Δ原点(date) + α·h_ref·T + c·L
+h_r(m) = H_r(m) − H_r(原点,该轮) + Δ原点(date) + α·h_ref·T + c·L
 ```
 
+- `H_r(原点,该轮)`：**逐轮**确定。版本未改选原点时取该轮 `round.origin_reading_m`；
+  版本改选原点时，必须取该轮 `round_tie.tie_elevation_m` 重新归算（缺该轮联测记录则
+  该轮判 `UNTIED` 致命）。因此原点偏移量的轮间变化会直接反映到整体升降，例如联系偏移
+  由 2.3500 m 变为 2.3495 m 时，整体升降相应变化 −0.0005 m。复算 JSON 的
+  `rounds.{a,b}.origin_source` 标明本轮实际采用的来源字段。
 - `Δ原点(date)`：取不晚于观测日的最新校准改正，消除**基点漂移**；
+  若该条校准记录 `stable=0`，原点即判失稳（`ORIGIN_UNSTABLE` 致命），对应轮次所有弧段
+  不计算，版本置 `rejected`，不能锁定或导出；
 - `α·h_ref·T`：罐壁温差改正（钢罐默认 α=1.2×10⁻⁵/℃）；
 - `c·L`：装液工况改正（`load_coeff_m_per_m × 液位`）。
 
@@ -50,10 +67,10 @@ h_r(m) = H_r(m) − H_r(原点) + Δ原点(date) + α·h_ref·T + c·L
 | 代码 | 规则 | 后果 |
 |---|---|---|
 | `LOOP_CLOSURE` | 闭合差 > `k·√L`（默认 k=4 mm/√km） | 整轮致命，全环重测 |
-| `ORIGIN_UNSTABLE` | 公共联系点相对变化中位值超 `origin_drift_m`（默认 3 mm） | 致命，原点/联系点重新联测 |
-| `UNTIED` | 原点无校准且非假定稳定点 | 致命，补原点校准 |
+| `ORIGIN_UNSTABLE` | 公共联系点相对变化中位值超 `origin_drift_m`（默认 3 mm），或不晚于观测日的最新校准记录 `stable=0` | 致命，原点/联系点重新联测 |
+| `UNTIED` | 原点无校准且非假定稳定点；或改选原点在该轮无 `round_tie` 联测记录 | 致命，补原点校准/补联测 |
 | `DUPLICATE_AZIMUTH` | 方位重号 | 相关弧段阻断、核查编号 |
-| `ORDER_INVERSION` | 环向观测次序倒置 | 该邻边阻断、次序核查 |
+| `ORDER_INVERSION` | 按**逐轮 `reading.order_idx`**（非 `marker.ring_order`）判定沿环向次序不增；最大序点回到最小序点的收测闭合边不判 | 受影响邻边阻断、次序核查 |
 | `MISSING` | 标志某轮漏测 | 相邻弧段阻断、逐点补测 |
 | `GAP_TOO_LONG` | 连续空缺弧 > `max_gap_deg`（默认 90°） | 致命，弧中给定点位补测 |
 | `TIE_SPREAD` / `MISSING_FRACTION` / `LOOP_DATA_MISSING` | 警告级 | 结果保留但提示 |

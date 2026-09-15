@@ -34,6 +34,14 @@
    重复绑定、荷载方向不符、观测间隔不足或来源轮次含致命问题时保持待判
    （pending）；速率或残余越限回指阶段与读数。改绑阶段或改取阈值须记 reason
    生成新试验修订；定稿(final)后导出逐级 JSON 与荷载—沉降 SVG。
+8. 接管位移兼容性：方案引用两个已锁定的沉降版本，登记接管方位、高度、局部
+   坐标系、3×3 管线柔度矩阵、支架冷态间隙与允许载荷包络。引擎从冻结的整体
+   升降、倾斜与主要谐波推算接管中心位移（倾斜坡度×高度得水平偏移），转换到
+   管线坐标后逐轴判定支架闭合、以柔度逆矩阵求接管反力并核算包络余量。来源
+   版本罐体不一致、有效弧覆盖不足、坐标变换退化、柔度矩阵不可逆或位移跨过
+   间隙边界时保持待判（pending）并回指来源版本与接管；改绑版本、接管或采用
+   保守边界须另存修订并说明理由；确认版固定来源结果与参数，输出逐接管 JSON
+   与位移—载荷 SVG。
 """
 
 import argparse
@@ -171,6 +179,33 @@ CREATE TABLE IF NOT EXISTS hydro_revision (
   created_at TEXT,
   finalized_at TEXT,
   result TEXT                          -- JSON 分级分析结果（定稿后冻结）
+);
+CREATE TABLE IF NOT EXISTS nozzle_plan (
+  id INTEGER PRIMARY KEY,
+  tank_id INTEGER NOT NULL REFERENCES tank(id),
+  code TEXT NOT NULL,                  -- 方案编号
+  version_a_id INTEGER REFERENCES version(id), -- 初始登记引用的锁定版本A/B
+  version_b_id INTEGER REFERENCES version(id),
+  params TEXT,                         -- JSON 覆盖 NOZZLE_PARAMS
+  note TEXT,
+  created_at TEXT,
+  UNIQUE(tank_id, code)
+);
+CREATE TABLE IF NOT EXISTS nozzle_revision (
+  id INTEGER PRIMARY KEY,
+  plan_id INTEGER NOT NULL REFERENCES nozzle_plan(id),
+  seq INTEGER NOT NULL,                -- 修订号（同方案递增）
+  version_a_id INTEGER NOT NULL REFERENCES version(id), -- 本修订绑定的来源版本
+  version_b_id INTEGER NOT NULL REFERENCES version(id),
+  nozzles TEXT NOT NULL,               -- JSON 接管登记快照（方位/高度/局部坐标系/
+                                       --   柔度矩阵/支架间隙/允许载荷包络）
+  conservative INTEGER DEFAULT 0,      -- 1=采用保守边界（间隙边界带按闭合计）
+  reason TEXT NOT NULL,                -- 修订依据（改绑/改接管/保守边界必须说明）
+  status TEXT DEFAULT 'pending',       -- pending(待判) / draft / confirmed(确认)
+  created_at TEXT,
+  confirmed_at TEXT,
+  result TEXT,                         -- JSON 逐接管分析结果（确认后冻结）
+  UNIQUE(plan_id, seq)
 );
 """
 
@@ -1999,6 +2034,626 @@ def finalize_hydro_revision(conn, rev):
 
 
 # ----------------------------------------------------------------------------
+# 接管位移兼容性：方案—修订—引擎—成果
+# ----------------------------------------------------------------------------
+
+NOZZLE_PARAMS = {
+    "gap_band_m": 0.0002,        # 间隙边界模糊带宽：||u|−g|≤band 判边界（接触不定）
+    "min_arc_coverage": 0.5,     # 来源版本有效弧覆盖下限（周长比例）
+    "coord_eps": 1e-9,           # 局部坐标轴零向量阈值
+    "coord_parallel_tol": 1e-6,  # 局部坐标轴近平行判定（正交残余/原长）
+}
+
+
+def mat3_vec(M, v):
+    """3×3 矩阵乘向量。"""
+    return [sum(M[i][j] * v[j] for j in range(3)) for i in range(3)]
+
+
+def mat3_inverse(M):
+    """3×3 矩阵求逆（高斯-若当，逐列解 M·x=e_j）；奇异时抛 ValueError。"""
+    cols = []
+    for j in range(3):
+        b = [1.0 if i == j else 0.0 for i in range(3)]
+        cols.append(_gauss([list(r) for r in M], b))
+    return [[cols[j][i] for j in range(3)] for i in range(3)]
+
+
+def ortho_frame(axis_x, axis_y, eps, par_tol):
+    """由两个参考向量构造右手正交局部坐标系。
+
+    e1 沿 axis_x；e2 为 axis_y 扣除 e1 分量后的单位向量；e3 = e1×e2。
+    零向量或近平行（正交残余 < par_tol·|axis_y|）返回 None（坐标变换退化）。
+    """
+    n1 = math.sqrt(sum(x * x for x in axis_x))
+    n2 = math.sqrt(sum(x * x for x in axis_y))
+    if n1 < eps or n2 < eps:
+        return None
+    e1 = [x / n1 for x in axis_x]
+    d = sum(a * b for a, b in zip(axis_y, e1))
+    y2 = [a - d * b for a, b in zip(axis_y, e1)]
+    ny = math.sqrt(sum(x * x for x in y2))
+    if ny < par_tol * n2:
+        return None
+    e2 = [x / ny for x in y2]
+    e3 = [e1[1] * e2[2] - e1[2] * e2[1],
+          e1[2] * e2[0] - e1[0] * e2[2],
+          e1[0] * e2[1] - e1[1] * e2[0]]
+    return e1, e2, e3
+
+
+def analyze_nozzle_revision(conn, plan, revision):
+    """接管位移兼容性引擎。
+
+    只读取两个来源版本的冻结结果（整体升降、倾斜、主要谐波、弧段阻断），
+    推算各接管中心位移 Δu = u(版本B) − u(版本A)：
+      水平分量 = 倾斜坡度×高度（刚体倾斜 Ω×r），
+      竖向分量 = −(整体升降 + 倾斜 + Σ主要谐波)（下沉为负）。
+    位移转换到接管局部坐标后逐轴判定支架状态（开启/边界/闭合），
+    越界位移经 K = 柔度⁻¹ 求接管反力，并对允许包络求利用率与余量。
+    致命问题 → 状态 pending（待判）；包络越限 → warning 不阻断确认。
+    """
+    tank = one(conn, "SELECT * FROM tank WHERE id=?", (plan["tank_id"],))
+    if not tank:
+        raise ApiError(400, "BAD_REFS", "罐体不存在")
+    params = dict(NOZZLE_PARAMS)
+    params.update(json.loads(plan["params"] or "{}"))
+    nozzles = json.loads(revision["nozzles"])
+    conservative = bool(revision["conservative"])
+    band = float(params["gap_band_m"])
+    radius = float(tank["radius_m"] or 0)
+
+    issues = []
+
+    def issue(code, severity, message, **refs):
+        issues.append({
+            "id": "I%02d" % (len(issues) + 1),
+            "code": code,
+            "severity": severity,           # fatal(待判) / warning / info
+            "message": message,
+            "version_ids": refs.get("version_ids", []),
+            "nozzle_codes": refs.get("nozzle_codes", []),
+            "marker_ids": refs.get("marker_ids", []),
+            "edge": refs.get("edge"),
+            "metric": refs.get("metric"),
+            "value": refs.get("value"),
+            "limit": refs.get("limit"),
+        })
+
+    # -- 来源版本：两个已锁定沉降版本，罐体必须一致 ---------------------------
+    src = {}
+    for tag, vid in (("a", revision["version_a_id"]),
+                     ("b", revision["version_b_id"])):
+        v = one(conn, "SELECT * FROM version WHERE id=?", (vid,)) if vid else None
+        if not v:
+            issue("VERSION_MISSING", "fatal",
+                  "来源版本 #%s 不存在" % vid,
+                  version_ids=[vid] if vid else [])
+            src[tag] = None
+            continue
+        vres = json.loads(v["result"]) if v["result"] else None
+        src[tag] = {"row": dict(v), "result": vres}
+        if v["status"] != "locked":
+            issue("VERSION_NOT_LOCKED", "fatal",
+                  "来源版本 V%d（罐内第 %d 版）状态为 %s，未锁定，"
+                  "接管位移分析只能引用已锁定版本"
+                  % (v["id"], v["seq"], v["status"]),
+                  version_ids=[v["id"]])
+        if v["tank_id"] != tank["id"]:
+            issue("VERSION_TANK_MISMATCH", "fatal",
+                  "来源版本 V%d 属罐 #%d，与本方案罐 #%d（%s）不一致"
+                  % (v["id"], v["tank_id"], tank["id"], tank["name"]),
+                  version_ids=[v["id"]])
+        if not vres or not vres.get("decomposition"):
+            issue("VERSION_RESULT_INCOMPLETE", "fatal",
+                  "来源版本 V%d 冻结结果缺少整体升降/倾斜分解，无法推算接管位移"
+                  % v["id"], version_ids=[v["id"]])
+    if src["a"] and src["b"] and \
+            src["a"]["row"]["tank_id"] != src["b"]["row"]["tank_id"]:
+        issue("VERSION_TANK_MISMATCH", "fatal",
+              "两个来源版本罐体不一致（V%d 属罐 #%d，V%d 属罐 #%d）"
+              % (src["a"]["row"]["id"], src["a"]["row"]["tank_id"],
+                 src["b"]["row"]["id"], src["b"]["row"]["tank_id"]),
+              version_ids=[src["a"]["row"]["id"], src["b"]["row"]["id"]])
+    if not radius:
+        issue("TANK_GEOMETRY", "fatal",
+              "罐体未登记半径，无法推算倾斜引起的接管水平位移")
+
+    # -- 冻结结果：有效弧覆盖 --------------------------------------------------
+    vdata = {}
+    vbrief = {}
+    for tag in ("a", "b"):
+        s = src.get(tag)
+        if not s:
+            continue
+        v, vres = s["row"], s["result"]
+        brief = {"id": v["id"], "seq": v["seq"], "status": v["status"],
+                 "tank_id": v["tank_id"], "round_a_id": v["round_a_id"],
+                 "round_b_id": v["round_b_id"], "locked_at": v["locked_at"]}
+        if vres:
+            edges = vres.get("edges") or []
+            pts = {p["marker_id"]: p for p in (vres.get("points") or [])}
+            cov = sum(float(e["span_deg"]) for e in edges
+                      if not e.get("blocked")) / 360.0
+            brief.update({"decomposition": vres.get("decomposition"),
+                          "tilt": vres.get("tilt"),
+                          "harmonics": vres.get("harmonics") or {},
+                          "arc_coverage": cov})
+            vdata[tag] = {"edges": edges, "points": pts, "coverage": cov}
+            if v["status"] == "locked" and vres.get("decomposition") \
+                    and cov < params["min_arc_coverage"]:
+                issue("ARC_COVERAGE", "fatal",
+                      "版本 V%d 有效弧覆盖 %.0f%% 低于允许 %.0f%%，"
+                      "环向沉降模型在接管方位不可靠"
+                      % (v["id"], cov * 100, params["min_arc_coverage"] * 100),
+                      version_ids=[v["id"]], metric="arc_coverage",
+                      value=cov, limit=params["min_arc_coverage"])
+        vbrief[tag] = brief
+
+    def blocked_edge_at(tag, az):
+        """接管方位所在的环向弧段；若被阻断返回该弧，否则 None。"""
+        info = vdata.get(tag)
+        if not info:
+            return None
+        for e in info["edges"]:
+            p1 = info["points"].get(e["from_marker_id"])
+            if p1 is None:
+                continue
+            if fwd_angle(float(p1["azimuth_deg"]), az) < float(e["span_deg"]):
+                return e if e.get("blocked") else None
+        return None
+
+    def disp_of(tag, az, h):
+        """由版本冻结分解推算接管中心位移（罐体坐标 [东,北,天]，m）。"""
+        s = src.get(tag)
+        if not s or not s["result"] or not s["result"].get("decomposition"):
+            return None
+        vres = s["result"]
+        dec = vres["decomposition"]
+        a0 = float(dec["body_m"])
+        ax = float(dec["tilt_cos_m"])
+        ay = float(dec["tilt_sin_m"])
+        t = math.radians(az)
+        # 刚体倾斜转动向量 Ω=(−ax/R, ay/R, 0)，接管水平位移 = Ω×r 的水平分量
+        dx = ay * h / radius if radius else 0.0
+        dy = ax * h / radius if radius else 0.0
+        s_vert = a0 + ax * math.cos(t) + ay * math.sin(t)
+        for k, hc in (vres.get("harmonics") or {}).items():
+            kk = int(k)
+            s_vert += float(hc["cos_m"]) * math.cos(kk * t) \
+                + float(hc["sin_m"]) * math.sin(kk * t)
+        return [dx, dy, -s_vert]
+
+    # -- 逐接管计算 ------------------------------------------------------------
+    nz_out = []
+    for nz in nozzles:
+        code = nz["code"]
+        az = float(nz["azimuth_deg"]) % 360.0
+        h = float(nz["height_m"])
+        entry = {"code": code, "azimuth_deg": az, "height_m": h,
+                 "axis_x": nz["axis_x"], "axis_y": nz["axis_y"],
+                 "flexibility": nz["flexibility"],
+                 "gap_m": nz["gap_m"], "allow_n": nz["allow_n"]}
+        for tag in ("a", "b"):
+            s = src.get(tag)
+            e = blocked_edge_at(tag, az)
+            if e and s:
+                issue("NOZZLE_ARC_BLOCKED", "fatal",
+                      "接管 %s 方位 %.1f° 位于版本 V%d 阻断弧 %s→%s 内，"
+                      "该方位沉降模型不可靠"
+                      % (code, az, s["row"]["id"], e["from_code"], e["to_code"]),
+                      version_ids=[s["row"]["id"]], nozzle_codes=[code],
+                      marker_ids=[e["from_marker_id"], e["to_marker_id"]],
+                      edge=[e["from_marker_id"], e["to_marker_id"]])
+        fr = ortho_frame(nz["axis_x"], nz["axis_y"],
+                         params["coord_eps"], params["coord_parallel_tol"])
+        if fr is None:
+            issue("COORD_DEGENERATE", "fatal",
+                  "接管 %s 局部坐标轴为零向量或接近平行，坐标变换退化" % code,
+                  nozzle_codes=[code])
+            nz_out.append(entry)
+            continue
+        e1, e2, e3 = fr
+        entry["frame"] = {"e1": e1, "e2": e2, "e3": e3}
+        try:
+            K = mat3_inverse(nz["flexibility"])
+        except ValueError:
+            issue("FLEX_SINGULAR", "fatal",
+                  "接管 %s 管线柔度矩阵不可逆，无法求接管反力" % code,
+                  nozzle_codes=[code])
+            nz_out.append(entry)
+            continue
+        entry["stiffness"] = K
+        da, db = disp_of("a", az, h), disp_of("b", az, h)
+        entry["disp_version_a_m"] = da
+        entry["disp_version_b_m"] = db
+        if da is None or db is None:
+            nz_out.append(entry)
+            continue
+        du = [db[i] - da[i] for i in range(3)]
+        entry["disp_global_m"] = du
+        uloc = [sum(e1[i] * du[i] for i in range(3)),
+                sum(e2[i] * du[i] for i in range(3)),
+                sum(e3[i] * du[i] for i in range(3))]
+        entry["disp_local_m"] = uloc
+
+        # 支架闭合：逐轴比较 |u| 与冷态间隙（保守边界取有效间隙 g−band）
+        states, excess, geff, hit = [], [], [], []
+        for i in range(3):
+            u, g = uloc[i], float(nz["gap_m"][i])
+            if conservative:
+                ge = max(g - band, 0.0)
+                geff.append(ge)
+                d = abs(u) - ge
+                if d > 0:
+                    states.append("closed")
+                    excess.append(math.copysign(d, u))
+                else:
+                    states.append("open")
+                    excess.append(0.0)
+            else:
+                d = abs(u) - g
+                if d > band:
+                    states.append("closed")
+                    excess.append(math.copysign(d, u))
+                elif d < -band:
+                    states.append("open")
+                    excess.append(0.0)
+                else:
+                    states.append("boundary")
+                    excess.append(math.copysign(max(d, 0.0), u))
+                    hit.append((i + 1, abs(u), g))
+        if conservative:
+            entry["gap_effective_m"] = geff
+        if hit:
+            issue("GAP_BOUNDARY", "fatal",
+                  "接管 %s %s 位移落在冷态间隙边界带宽 ±%.2f mm 内，"
+                  "支架接触状态不定"
+                  % (code,
+                     "、".join("第%d轴（|u|=%.3f mm，间隙 %.3f mm）"
+                               % (i, u * 1000, g * 1000) for i, u, g in hit),
+                     band * 1000),
+                  nozzle_codes=[code],
+                  version_ids=[revision["version_a_id"],
+                               revision["version_b_id"]],
+                  metric="gap_boundary_m",
+                  value=hit[0][1] - hit[0][2], limit=band)
+        entry["axis_state"] = states
+        entry["excess_m"] = excess
+
+        # 接管反力 f = K·e 与允许载荷包络余量
+        f = mat3_vec(K, excess)
+        entry["reaction_n"] = f
+        allow = [float(x) for x in nz["allow_n"]]
+        util = [abs(f[i]) / allow[i] for i in range(3)]
+        entry["utilization"] = util
+        entry["margin"] = min(1.0 - u_ for u_ in util)
+        over = [(i + 1, util[i]) for i in range(3) if util[i] > 1.0]
+        if over:
+            issue("ENVELOPE_EXCEED", "warning",
+                  "接管 %s %s 反力超允许载荷包络"
+                  % (code, "、".join("第%d轴利用率 %.0f%%"
+                                     % (i, u_ * 100) for i, u_ in over)),
+                  nozzle_codes=[code], metric="envelope_utilization",
+                  value=max(u_ for _, u_ in over), limit=1.0)
+        nz_out.append(entry)
+
+    all_u = [abs(u) for e in nz_out for u in (e.get("disp_local_m") or [])]
+    utils = [u_ for e in nz_out for u_ in (e.get("utilization") or [])]
+    margins = [e["margin"] for e in nz_out if e.get("margin") is not None]
+    states_all = [s_ for e in nz_out for s_ in (e.get("axis_state") or [])]
+    fatal = [i for i in issues if i["severity"] == "fatal"]
+    result = {
+        "revision_id": revision["id"],
+        "revision_seq": revision["seq"],
+        "plan": {"id": plan["id"], "code": plan["code"]},
+        "tank": {"id": tank["id"], "name": tank["name"],
+                 "radius_m": tank["radius_m"]},
+        "reason": revision["reason"],
+        "conservative": conservative,
+        "params": params,
+        "model": {
+            "delta": "Δu = u(版本B) − u(版本A)，建议两版本共用同一基准轮次",
+            "horizontal": "水平位移 = 倾斜坡度×高度（刚体倾斜 Ω×r）",
+            "vertical": "竖向位移 = −(整体升降+倾斜+Σ主要谐波)，下沉为负",
+            "reaction": "接管反力 f = K·e，K = 柔度矩阵⁻¹，e = 越过冷态间隙的位移",
+            "gap_band": "||u|−g| ≤ gap_band_m 判间隙边界（接触不定，待判）；"
+                        "保守边界修订按有效间隙 g−band 全部按闭合计",
+        },
+        "versions": vbrief,
+        "nozzles": nz_out,
+        "summary": {
+            "nozzle_count": len(nz_out),
+            "max_local_disp_m": max(all_u) if all_u else None,
+            "closed_axes": sum(1 for s_ in states_all if s_ == "closed"),
+            "boundary_axes": sum(1 for s_ in states_all if s_ == "boundary"),
+            "max_utilization": max(utils) if utils else None,
+            "min_margin": min(margins) if margins else None,
+        },
+        "issues": issues,
+        "generated_at": now_iso(),
+    }
+    result["status"] = "pending" if fatal else "draft"
+    return result
+
+
+def build_nozzle_svg(result):
+    """位移—载荷 SVG。
+
+    左图：逐接管各局部轴 |位移| 柱（绿=间隙内、橙=边界、红=闭合），
+    黑横线=冷态间隙，橙色带=间隙边界带宽；右图：反力包络利用率柱，
+    红虚线=允许包络 100%。
+    """
+    W, H = 960, 640
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
+             'viewBox="0 0 %d %d" font-family="sans-serif">' % (W, H, W, H)]
+    parts.append('<rect width="100%" height="100%" fill="white"/>')
+    parts.append('<text x="20" y="36" font-size="20" font-weight="bold">'
+                 '%s 接管位移—支架载荷（方案 %s 修订 R%d）</text>'
+                 % (result["tank"]["name"], result["plan"]["code"],
+                    result["revision_seq"]))
+    if result.get("status") == "pending":
+        parts.append('<text x="%d" y="36" font-size="13" fill="#b00" '
+                     'text-anchor="end">存在致命问题，保持待判</text>' % (W - 20))
+    if result.get("conservative"):
+        parts.append('<text x="%d" y="56" font-size="12" fill="#c60" '
+                     'text-anchor="end">采用保守边界（间隙边界带按闭合计）</text>'
+                     % (W - 20))
+    nzs = [e for e in result.get("nozzles", []) if e.get("disp_local_m")]
+    if not nzs:
+        parts.append('<text x="480" y="320" text-anchor="middle" fill="#b00">'
+                     '无有效接管位移（致命问题或数据缺失）</text>')
+        parts.append("</svg>")
+        return "\n".join(parts)
+
+    x1, x2 = 80, 450
+    x3, x4 = 580, 930
+    ytop, ybot = 100, 420
+    umax = 1e-9
+    for e in nzs:
+        umax = max(umax, max(abs(u) for u in e["disp_local_m"]),
+                   max(float(g) for g in e["gap_m"]))
+    umax_mm = umax * 1000.0 * 1.15
+    umax_r = 1.2
+    for e in nzs:
+        for u_ in (e.get("utilization") or []):
+            umax_r = max(umax_r, u_ * 1.15)
+
+    def Y1(vmm):
+        return ybot - (ybot - ytop) * vmm / umax_mm
+
+    def Y2(r):
+        return ybot - (ybot - ytop) * r / umax_r
+
+    for k in range(6):
+        v = umax_mm * k / 5
+        y = Y1(v)
+        parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#eee"/>'
+                     % (x1, y, x2, y))
+        parts.append('<text x="%d" y="%.1f" font-size="10" fill="#888" '
+                     'text-anchor="end">%.2f</text>' % (x1 - 6, y + 3, v))
+    for k in range(6):
+        r = umax_r * k / 5
+        y = Y2(r)
+        parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#eee"/>'
+                     % (x3, y, x4, y))
+        parts.append('<text x="%d" y="%.1f" font-size="10" fill="#888" '
+                     'text-anchor="end">%.0f%%</text>' % (x3 - 6, y + 3, r * 100))
+    parts.append('<rect x="%d" y="%d" width="%d" height="%d" fill="none" '
+                 'stroke="#999"/>' % (x1, ytop, x2 - x1, ybot - ytop))
+    parts.append('<rect x="%d" y="%d" width="%d" height="%d" fill="none" '
+                 'stroke="#999"/>' % (x3, ytop, x4 - x3, ybot - ytop))
+    parts.append('<text x="%.1f" y="%d" font-size="12" text-anchor="middle">'
+                 '局部位移 |u| (mm) 与冷态间隙</text>'
+                 % ((x1 + x2) / 2.0, ytop - 10))
+    parts.append('<text x="%.1f" y="%d" font-size="12" text-anchor="middle">'
+                 '接管反力包络利用率</text>' % ((x3 + x4) / 2.0, ytop - 10))
+    parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#c00" '
+                 'stroke-dasharray="5 4"/>' % (x3, Y2(1.0), x4, Y2(1.0)))
+    parts.append('<text x="%d" y="%.1f" font-size="10" fill="#c00">'
+                 '允许包络 100%%</text>' % (x3 + 4, Y2(1.0) - 5))
+
+    state_col = {"open": "#0a7", "closed": "#d33", "boundary": "#e80"}
+    band_mm = float(result["params"]["gap_band_m"]) * 1000.0
+    n_nz = len(nzs)
+    gw1 = (x2 - x1) / float(n_nz)
+    gw2 = (x4 - x3) / float(n_nz)
+    bw = min(20.0, gw1 / 4.5)
+    for i, e in enumerate(nzs):
+        states = e.get("axis_state") or ["open"] * 3
+        utils = e.get("utilization") or [None] * 3
+        for j in range(3):
+            u = abs(e["disp_local_m"][j]) * 1000.0
+            bx = x1 + i * gw1 + (j + 0.5) * (gw1 / 3.0) - bw / 2
+            parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+                         'fill="%s"/>' % (bx, Y1(u), bw, ybot - Y1(u),
+                                          state_col[states[j]]))
+            g = float(e["gap_m"][j]) * 1000.0
+            y_hi = Y1(g + band_mm)
+            y_lo = Y1(max(g - band_mm, 0.0))
+            parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+                         'fill="#e80" fill-opacity="0.18"/>'
+                         % (bx - 2, y_hi, bw + 4, y_lo - y_hi))
+            parts.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
+                         'stroke="#000" stroke-width="2"/>'
+                         % (bx - 2, Y1(g), bx + bw + 2, Y1(g)))
+            parts.append('<text x="%.1f" y="%d" font-size="9" fill="#666" '
+                         'text-anchor="middle">%s</text>'
+                         % (bx + bw / 2, ybot + 12, "xyz"[j]))
+            u_ = utils[j]
+            if u_ is not None:
+                col = "#d33" if u_ > 1 else ("#e80" if u_ > 0.8 else "#0a7")
+                bx2 = x3 + i * gw2 + (j + 0.5) * (gw2 / 3.0) - bw / 2
+                parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+                             'fill="%s"/>' % (bx2, Y2(u_), bw, ybot - Y2(u_),
+                                              col))
+                parts.append('<text x="%.1f" y="%d" font-size="9" fill="#666" '
+                             'text-anchor="middle">%s</text>'
+                             % (bx2 + bw / 2, ybot + 12, "xyz"[j]))
+        parts.append('<text x="%.1f" y="%d" font-size="11" font-weight="bold" '
+                     'text-anchor="middle">%s</text>'
+                     % (x1 + i * gw1 + gw1 / 2, ybot + 28, e["code"]))
+        parts.append('<text x="%.1f" y="%d" font-size="11" font-weight="bold" '
+                     'text-anchor="middle">%s</text>'
+                     % (x3 + i * gw2 + gw2 / 2, ybot + 28, e["code"]))
+
+    lx, ly = 80, 500
+    legend = [("#0a7", "间隙内（支架未受力）"),
+              ("#e80", "间隙边界 / 利用率>80%"),
+              ("#d33", "支架闭合 / 包络越限"),
+              ("#000", "黑线＝冷态间隙（橙带＝边界带宽）")]
+    parts.append('<text x="%d" y="%d" font-size="14" font-weight="bold">图例</text>'
+                 % (lx, ly - 24))
+    for i, (c, lab) in enumerate(legend):
+        y = ly + i * 24
+        parts.append('<rect x="%d" y="%d" width="16" height="6" fill="%s"/>'
+                     % (lx, y - 5, c))
+        parts.append('<text x="%d" y="%d" font-size="12">%s</text>'
+                     % (lx + 24, y, lab))
+
+    summ = result.get("summary", {})
+    lines = []
+    if summ.get("max_local_disp_m") is not None:
+        lines.append("最大局部位移: %.2f mm" % (summ["max_local_disp_m"] * 1000))
+    lines.append("闭合轴 %d，边界轴 %d" % (summ.get("closed_axes", 0),
+                                        summ.get("boundary_axes", 0)))
+    if summ.get("max_utilization") is not None:
+        lines.append("最大包络利用率: %.0f%%" % (summ["max_utilization"] * 100))
+    if summ.get("min_margin") is not None:
+        lines.append("最小包络余量: %.0f%%" % (summ["min_margin"] * 100))
+    y = ly - 10
+    for s in lines:
+        parts.append('<text x="%d" y="%d" font-size="12">%s</text>' % (480, y, s))
+        y += 22
+
+    n_fatal = len([i for i in result.get("issues", [])
+                   if i["severity"] == "fatal"])
+    parts.append('<text x="20" y="%d" font-size="12" fill="#a00">'
+                 '问题 %d 项（致命 %d，详见逐接管 JSON）</text>'
+                 % (H - 20, len(result.get("issues", [])), n_fatal))
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def normalize_nozzle_spec(nz, idx):
+    """校验并归一化单只接管登记（方位/高度/坐标系/柔度/间隙/包络）。"""
+    if not isinstance(nz, dict):
+        raise ApiError(400, "BAD_NOZZLE", "第 %d 个接管登记应为对象" % idx)
+    require(nz, ["code", "azimuth_deg", "height_m", "axis_x", "axis_y",
+                 "flexibility", "gap_m", "allow_n"])
+    code = str(nz["code"])
+
+    def vec3(x, field):
+        if not isinstance(x, (list, tuple)) or len(x) != 3:
+            raise ApiError(400, "BAD_NOZZLE",
+                           "接管 %s 的 %s 应为 3 分量数组" % (code, field))
+        try:
+            return [float(v) for v in x]
+        except (TypeError, ValueError):
+            raise ApiError(400, "BAD_NOZZLE",
+                           "接管 %s 的 %s 含非数值分量" % (code, field))
+
+    try:
+        az = float(nz["azimuth_deg"])
+        h = float(nz["height_m"])
+    except (TypeError, ValueError):
+        raise ApiError(400, "BAD_NOZZLE", "接管 %s 方位/高度应为数值" % code)
+    if h < 0:
+        raise ApiError(400, "BAD_NOZZLE", "接管 %s 高度不能为负" % code)
+    flex = nz["flexibility"]
+    if not isinstance(flex, (list, tuple)) or len(flex) != 3 or \
+            any(not isinstance(r, (list, tuple)) or len(r) != 3 for r in flex):
+        raise ApiError(400, "BAD_FLEX", "接管 %s 柔度矩阵应为 3×3 数组" % code)
+    try:
+        F = [[float(v) for v in r] for r in flex]
+    except (TypeError, ValueError):
+        raise ApiError(400, "BAD_FLEX", "接管 %s 柔度矩阵含非数值元素" % code)
+    gap = vec3(nz["gap_m"], "gap_m")
+    if any(g < 0 for g in gap):
+        raise ApiError(400, "BAD_NOZZLE", "接管 %s 支架间隙不能为负" % code)
+    allow = vec3(nz["allow_n"], "allow_n")
+    if any(a <= 0 for a in allow):
+        raise ApiError(400, "BAD_NOZZLE", "接管 %s 允许载荷必须为正" % code)
+    return {"code": code, "azimuth_deg": az, "height_m": h,
+            "axis_x": vec3(nz["axis_x"], "axis_x"),
+            "axis_y": vec3(nz["axis_y"], "axis_y"),
+            "flexibility": F, "gap_m": gap, "allow_n": allow,
+            "note": nz.get("note")}
+
+
+def normalize_nozzles(raw):
+    """校验并归一化接管登记数组；编号不得重复。"""
+    if not isinstance(raw, list) or not raw:
+        raise ApiError(400, "BAD_NOZZLES", "nozzles 必须为非空数组")
+    out, seen = [], set()
+    for idx, nz in enumerate(raw, 1):
+        spec = normalize_nozzle_spec(nz, idx)
+        if spec["code"] in seen:
+            raise ApiError(400, "DUP_NOZZLE", "接管编号重复: %s" % spec["code"])
+        seen.add(spec["code"])
+        out.append(spec)
+    return out
+
+
+def validate_nozzle_params(raw):
+    """方案参数覆盖校验：仅允许 NOZZLE_PARAMS 已知字段。"""
+    if not isinstance(raw, dict):
+        raise ApiError(400, "BAD_PARAMS", "params 应为对象")
+    for k in raw:
+        if k not in NOZZLE_PARAMS:
+            raise ApiError(400, "BAD_PARAMS", "未知参数: %s" % k)
+    return {k: float(v) for k, v in raw.items()}
+
+
+def resolve_version_ref(conn, x):
+    """版本引用（id 或 {"id"}）→ 版本 id；不存在 400。"""
+    if isinstance(x, dict) and x.get("id") is not None:
+        vid = int(x["id"])
+    elif isinstance(x, int):
+        vid = x
+    else:
+        raise ApiError(400, "BAD_VERSION", "版本引用应为 id 或 {\"id\"}")
+    if not one(conn, "SELECT 1 FROM version WHERE id=?", (vid,)):
+        raise ApiError(400, "BAD_VERSION", "沉降版本 %s 不存在" % vid)
+    return vid
+
+
+def create_nozzle_revision(conn, plan, va_id, vb_id, nozzles, conservative,
+                           reason):
+    """新建方案修订并立即运行接管引擎（改绑/改接管/保守边界必须给出 reason）。"""
+    seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM nozzle_revision "
+                       "WHERE plan_id=?", (plan["id"],)).fetchone()[0]
+    rid = conn.execute(
+        "INSERT INTO nozzle_revision(plan_id,seq,version_a_id,version_b_id,"
+        "nozzles,conservative,reason,status,created_at) "
+        "VALUES(?,?,?,?,?,?,?,'pending',?)",
+        (plan["id"], seq, va_id, vb_id, json.dumps(nozzles, ensure_ascii=False),
+         1 if conservative else 0, reason, now_iso())).lastrowid
+    conn.commit()
+    rev = one(conn, "SELECT * FROM nozzle_revision WHERE id=?", (rid,))
+    result = analyze_nozzle_revision(conn, plan, rev)
+    conn.execute("UPDATE nozzle_revision SET status=?, result=? WHERE id=?",
+                 (result["status"], json.dumps(result, ensure_ascii=False), rid))
+    conn.commit()
+    return one(conn, "SELECT * FROM nozzle_revision WHERE id=?", (rid,)), result
+
+
+def confirm_nozzle_revision(conn, rev):
+    """确认：仅 draft 可确认；pending（待判）须改绑/改接管/保守边界后新建修订。"""
+    if rev["status"] == "pending":
+        raise ApiError(409, "NOZZLE_PENDING",
+                       "修订含致命问题，保持待判，不能确认；"
+                       "请改绑版本、接管或采用保守边界后新建修订")
+    if rev["status"] == "confirmed":
+        raise ApiError(409, "NOZZLE_CONFIRMED", "修订已确认")
+    with write_lock:
+        conn.execute("UPDATE nozzle_revision SET status='confirmed',"
+                     "confirmed_at=? WHERE id=?", (now_iso(), rev["id"]))
+        conn.commit()
+    return one(conn, "SELECT * FROM nozzle_revision WHERE id=?", (rev["id"],))
+
+
+# ----------------------------------------------------------------------------
 # HTTP 服务
 # ----------------------------------------------------------------------------
 
@@ -2067,7 +2722,14 @@ class Handler(BaseHTTPRequestHandler):
                                  "GET  /hydro-tests/<id>/revisions[/<seq>]",
                                  "POST /hydro-tests/<id>/revisions/<seq>/finalize",
                                  "GET  /hydro-tests/<id>/revisions/<seq>/stages.json",
-                                 "GET  /hydro-tests/<id>/revisions/<seq>/load-settlement.svg"]})
+                                 "GET  /hydro-tests/<id>/revisions/<seq>/load-settlement.svg",
+                                 "POST /nozzle-plans (引用两个锁定版本+接管登记)",
+                                 "GET  /nozzle-plans[/<id>]",
+                                 "POST /nozzle-plans/<id>/revisions (改绑/保守边界)",
+                                 "GET  /nozzle-plans/<id>/revisions[/<seq>]",
+                                 "POST /nozzle-plans/<id>/revisions/<seq>/confirm",
+                                 "GET  /nozzle-plans/<id>/revisions/<seq>/nozzles.json",
+                                 "GET  /nozzle-plans/<id>/revisions/<seq>/displacement-load.svg"]})
             return
 
         root = parts[0]
@@ -2077,6 +2739,7 @@ class Handler(BaseHTTPRequestHandler):
             "rounds": self._rounds, "readings": self._readings,
             "ties": self._ties, "versions": self._versions,
             "analyze": self._analyze, "hydro-tests": self._hydro_tests,
+            "nozzle-plans": self._nozzle_plans,
         }
         if root not in routes:
             raise ApiError(404, "NOT_FOUND", "未知路径: %s" % root)
@@ -2605,6 +3268,134 @@ class Handler(BaseHTTPRequestHandler):
         else:
             raise ApiError(404, "NOT_FOUND", "不支持的操作")
 
+    # -- 接管位移兼容性 --------------------------------------------------------
+    def _nozzle_plans(self, conn, parts, q):
+        method = self._method()
+        if method == "POST" and not parts:
+            d = self._json_body()
+            require(d, ["tank_id", "code", "version_a", "version_b", "nozzles"])
+            tank = one(conn, "SELECT * FROM tank WHERE id=?", (d["tank_id"],))
+            if not tank:
+                raise ApiError(400, "BAD_TANK", "tank_id 不存在")
+            va = resolve_version_ref(conn, d["version_a"])
+            vb = resolve_version_ref(conn, d["version_b"])
+            if va == vb:
+                raise ApiError(400, "BAD_VERSION", "两个来源版本必须不同")
+            nozzles = normalize_nozzles(d["nozzles"])
+            params = validate_nozzle_params(d.get("params") or {})
+            with write_lock:
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO nozzle_plan(tank_id,code,version_a_id,"
+                        "version_b_id,params,note,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (tank["id"], d["code"], va, vb,
+                         json.dumps(params, ensure_ascii=False),
+                         d.get("note"), now_iso()))
+                except sqlite3.IntegrityError:
+                    raise ApiError(409, "DUP_NOZZLE_PLAN",
+                                   "方案编号已存在: %s" % d["code"])
+                plan = one(conn, "SELECT * FROM nozzle_plan WHERE id=?",
+                           (cur.lastrowid,))
+                rev, result = create_nozzle_revision(
+                    conn, plan, va, vb, nozzles,
+                    1 if d.get("conservative") else 0,
+                    d.get("reason") or "初始方案登记")
+            self._send(201, {"plan_id": plan["id"], "revision_id": rev["id"],
+                             "seq": rev["seq"], "status": result["status"],
+                             "result": result})
+            return
+        if method == "GET" and not parts:
+            sql = "SELECT * FROM nozzle_plan"
+            args = ()
+            if q.get("tank_id"):
+                sql += " WHERE tank_id=?"
+                args = (int(q["tank_id"][0]),)
+            sql += " ORDER BY id"
+            self._send(200, allrows(conn, sql, args))
+            return
+        pid = int(parts[0])
+        plan = one(conn, "SELECT * FROM nozzle_plan WHERE id=?", (pid,))
+        if not plan:
+            raise ApiError(404, "NOT_FOUND", "接管方案不存在")
+        if method == "GET" and len(parts) == 1:
+            out = dict(plan)
+            out["params"] = json.loads(plan["params"] or "{}")
+            out["revisions"] = allrows(
+                conn, "SELECT id,seq,status,conservative,reason,created_at,"
+                      "confirmed_at FROM nozzle_revision WHERE plan_id=? "
+                      "ORDER BY seq", (pid,))
+            self._send(200, out)
+        elif len(parts) >= 2 and parts[1] == "revisions":
+            self._nozzle_revisions(conn, plan, parts[2:])
+        else:
+            raise ApiError(404, "NOT_FOUND", "不支持的操作")
+
+    def _nozzle_revisions(self, conn, plan, parts):
+        method = self._method()
+        if method == "POST" and not parts:
+            d = self._json_body()
+            require(d, ["reason"])
+            prev = one(conn, "SELECT * FROM nozzle_revision WHERE plan_id=? "
+                             "ORDER BY seq DESC LIMIT 1", (plan["id"],))
+            if prev is None and (d.get("version_a") is None
+                                 or d.get("version_b") is None
+                                 or d.get("nozzles") is None):
+                raise ApiError(400, "MISSING_FIELD",
+                               "首个修订必须给出 version_a、version_b 与 nozzles")
+            va = resolve_version_ref(conn, d["version_a"]) \
+                if d.get("version_a") is not None else prev["version_a_id"]
+            vb = resolve_version_ref(conn, d["version_b"]) \
+                if d.get("version_b") is not None else prev["version_b_id"]
+            if va == vb:
+                raise ApiError(400, "BAD_VERSION", "两个来源版本必须不同")
+            nozzles = normalize_nozzles(d["nozzles"]) \
+                if d.get("nozzles") is not None else json.loads(prev["nozzles"])
+            cons = 1 if d.get("conservative", bool(prev["conservative"])) else 0
+            with write_lock:
+                rev, result = create_nozzle_revision(
+                    conn, plan, va, vb, nozzles, cons, d["reason"])
+            self._send(201, {"revision_id": rev["id"], "seq": rev["seq"],
+                             "status": result["status"], "result": result})
+            return
+        if method == "GET" and not parts:
+            self._send(200, allrows(
+                conn, "SELECT id,seq,status,conservative,reason,created_at,"
+                      "confirmed_at FROM nozzle_revision WHERE plan_id=? "
+                      "ORDER BY seq", (plan["id"],)))
+            return
+        rseq = int(parts[0])
+        rev = one(conn, "SELECT * FROM nozzle_revision WHERE plan_id=? AND seq=?",
+                  (plan["id"], rseq))
+        if not rev:
+            raise ApiError(404, "NOT_FOUND", "方案修订不存在")
+        if method == "GET" and len(parts) == 1:
+            out = dict(rev)
+            out["nozzles"] = json.loads(rev["nozzles"])
+            out["result"] = json.loads(rev["result"]) if rev["result"] else None
+            self._send(200, out)
+        elif method == "POST" and len(parts) == 2 and parts[1] == "confirm":
+            rev = confirm_nozzle_revision(conn, rev)
+            self._send(200, {"id": rev["id"], "seq": rev["seq"],
+                             "status": rev["status"],
+                             "confirmed_at": rev["confirmed_at"]})
+        elif method == "GET" and len(parts) == 2 and parts[1] in \
+                ("nozzles.json", "displacement-load.svg"):
+            if rev["status"] != "confirmed":
+                raise ApiError(409, "NOZZLE_NOT_CONFIRMED",
+                               "修订未确认，不能导出成果（当前状态 %s）"
+                               % rev["status"])
+            result = json.loads(rev["result"])
+            if parts[1] == "nozzles.json":
+                self._send(200, result, "application/json; charset=utf-8",
+                           {"Content-Disposition":
+                            'attachment; filename="nozzle_p%d_r%d.json"'
+                            % (plan["id"], rev["seq"])})
+            else:
+                self._send(200, build_nozzle_svg(result), "image/svg+xml")
+        else:
+            raise ApiError(404, "NOT_FOUND", "不支持的操作")
+
     def _method(self):
         return self.command
 
@@ -2765,6 +3556,7 @@ def selftest(db_path=":memory:"):
     reg2_stable_zero(conn)
     reg3_reading_order_idx(conn)
     reg4_hydro_staging(conn)
+    reg5_nozzle_compat(conn)
 
     print("SELF-TEST PASS")
     return True

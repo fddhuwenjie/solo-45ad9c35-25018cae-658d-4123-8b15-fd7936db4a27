@@ -12,7 +12,7 @@ python3 tank_settlement.py --demo          # 植入一个 16 点示范罐后启�
 python3 tank_settlement.py --selftest      # 内置数值/质检自测（含三条缺陷回归）
 ```
 
-`--selftest` 除数值复原外，固定复现三条复核确认缺陷的回归用例：
+`--selftest` 除数值复原外，固定复现四条复核确认缺陷的回归用例：
 
 1. `reg1_origin_switch_rereduce`：改选 BM1 后逐轮按 `round_tie.tie_elevation_m`
    重归算；联系偏移 2.3500→2.3495 m 时整体升降由 0.0100 变为 0.0095（Δ=−0.0005）；
@@ -20,7 +20,11 @@ python3 tank_settlement.py --selftest      # 内置数值/质检自测（含三�
    版本 `rejected` 不可锁定；
 3. `reg3_reading_order_idx`：校验读取逐轮 `reading.order_idx`；15 条有效读数反向施测
    时产生 `ORDER_INVERSION`（7+6 弧两段），13 条倒置弧加剔除点两邻边阻断，仅收测闭合边
-   保留，问题回指 15 个原始读数 id；升序对照组不误报。
+   保留，问题回指 15 个原始读数 id；升序对照组不误报；
+4. `reg4_hydro_staging`：两级水压试验全链路——保压速率 0.25/0.10 mm/h（限 0.2）、
+   残余 12 mm（限 10）分别回指阶段与读数；重复绑定、阶段倒序、荷载方向不符、
+   观测间隔不足、来源轮次致命五类均保持 `pending`；改取阈值生成新修订且越限判定
+   随之变化；`draft` 可定稿并保存 7 个所用轮次，`pending` 拒绝定稿。
 
 ## 数据模型（SQLite）
 
@@ -34,6 +38,9 @@ python3 tank_settlement.py --selftest      # 内置数值/质检自测（含三�
 | `reading` | 逐标志原始高程（**问题回指的原始凭据**） |
 | `round_tie` | 每轮对其它基准点的联测高程（判定原点漂移） |
 | `version` | 分析版本：选定两轮、可选改选原点、剔除读数及理由、容差参数、锁定状态、结果 JSON |
+| `hydro_test` | 水压试验方案头：试验编号、介质密度（默认水 1000 kg/m³） |
+| `hydro_stage` | 方案各级：目标液位、最短保压时长、允许沉降速率、残余沉降限值 |
+| `hydro_revision` | 试验修订：槽位绑定 JSON、改取阈值、依据 reason、状态（pending/draft/final）、结果 JSON |
 
 ## 归算与分析
 
@@ -87,6 +94,58 @@ h_r(m) = H_r(m) − H_r(原点,该轮) + Δ原点(date) + α·h_ref·T + c·L
 - 容差通过 `params` 覆盖 `DEFAULT_PARAMS`；版本号同罐递增，结果随版本冻结；
 - `POST /versions/<id>/lock` 锁定后成果方可导出（锁定即不可再改，复算请新建版本）。
 
+## 分级加载（水压试验）
+
+只比较试验前后两轮会把保压期仍在发展的沉降混入加载变形，也看不出卸载后的永久
+沉降。本模块按"方案 → 修订 → 定稿"管理分级加载分析，**复用逐轮归算与质检机制**
+（同一套 `qc_*` 函数：原点/校准/温度/液位改正、环线闭合差、原点稳定、方位重号、
+观测次序、漏测）。
+
+**方案**（`POST /hydro-tests`，目标液位必须逐级升高）：各级填写
+`target_level_m`（目标液位）、`min_hold_hours`（最短保压时长）、
+`rate_limit_m_per_h`（允许沉降速率）、`residual_limit_m`（残余沉降限值）。
+
+**修订**（`POST /hydro-tests/<id>/revisions`，必须给 `reason`）：按顺序绑定
+空罐、各级充水/保压、卸载、复测轮次（轮次可用 `seq` 或 `{"id"}` 引用）：
+
+```json
+{
+  "bindings": {"empty": 1,
+               "stages": [{"fill": 2, "hold": 3}, {"fill": 4, "hold": 5}],
+               "unload": 6, "recheck": 7},
+  "thresholds": {"stages": {"1": {"rate_limit_m_per_h": 0.0003}}},
+  "reason": "改取阈值：按岩土复核意见放宽一级速率限值"
+}
+```
+
+改绑阶段或改取阈值都会生成新的试验修订并留痕（`reason` 记入修订，有效阈值 =
+方案值被 `thresholds` 覆盖，结果中同时保存 `plan` 与生效值）。
+
+**引擎**：以 `q = ρ·g·h`（ρ 取轮次 `liquid_density`，缺省用试验介质密度）换算
+荷载，以空罐轮为基准逐标志计算：
+
+- 各级**充水增量**与**保压增量**、**保压速率**（保压增量 ÷ 充水→保压时长）；
+- **卸载回弹率** =（末级保压沉降 − 卸载沉降）÷ 末级保压沉降；
+- **残余沉降** = 复测轮沉降（相对空罐）；
+- **加载—卸载滞回环面积**（荷载—沉降折线闭合面积，kPa·mm）。
+
+**待判（pending，不定稿）**：阶段倒序（槽位观测时间非严格递增）、同一轮次重复
+绑定、荷载方向不符（空罐带液位、充水液位未升高、保压液位变动、卸载未下降、
+复测液位回升）、观测间隔不足（保压时长 < 最短保压）、来源轮次含致命质检问题
+（`ROUND_FATAL`，附 `LOOP_CLOSURE`/`UNTIED`/`ORIGIN_UNSTABLE` 等原始代码）。
+
+**越限回指（warning，不阻断定稿）**：`SETTLEMENT_RATE`（保压速率越限）与
+`RESIDUAL_SETTLEMENT`（残余越限，按末级限值判定）的 issue 带 `stage_seq`、
+`marker_ids`、`reading_ids`、`metric/value/limit` 回指阶段与原始读数。
+
+**定稿**（`POST .../revisions/<seq>/finalize`）：仅 `draft` 可定稿；定稿行保存
+所用轮次（`rounds_used`）及其分析版本（修订号 + 冻结的结果 JSON）。定稿后导出：
+
+- `GET .../revisions/<seq>/stages.json`：逐级 JSON（各级增量/速率/限值、逐标志
+  序列、回弹/残余/滞回、全部 issue 与补测建议）；
+- `GET .../revisions/<seq>/load-settlement.svg`：荷载—沉降曲线（蓝=加载均值、
+  橙=卸载均值、灰=逐标志、橙色区=滞回环、竖虚线=分级目标荷载、红虚线=残余沉降）。
+
 ## HTTP 接口
 
 | 方法与路径 | 说明 |
@@ -105,6 +164,13 @@ h_r(m) = H_r(m) − H_r(原点,该轮) + Δ原点(date) + α·h_ref·T + c·L
 | `GET /versions/{id}/recompute.json` | **复算 JSON**（仅锁定） |
 | `GET /versions/{id}/resurvey.csv` | **补测表**（UTF-8 带 BOM，Excel 直接打开） |
 | `GET /versions/{id}/settlement.svg` | **环向沉降图**（极坐标环形图） |
+| `POST /hydro-tests`、`GET /hydro-tests[?tank_id=]` | 建水压试验方案（含 `stages` 各级限值）/ 列表 |
+| `GET /hydro-tests/{id}` | 方案详情（含各级与修订清单） |
+| `POST /hydro-tests/{id}/revisions` | 新试验修订（改绑/改阈值，必须 `reason`），立即分级复算 |
+| `GET /hydro-tests/{id}/revisions[/{seq}]` | 修订清单 / 详情（含结果 JSON） |
+| `POST /hydro-tests/{id}/revisions/{seq}/finalize` | 定稿（仅 `draft`；`pending` 返回 409） |
+| `GET /hydro-tests/{id}/revisions/{seq}/stages.json` | **逐级 JSON**（仅定稿） |
+| `GET /hydro-tests/{id}/revisions/{seq}/load-settlement.svg` | **荷载—沉降曲线**（仅定稿） |
 
 ### 建轮次示例
 
